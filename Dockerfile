@@ -8,4 +8,6 @@ WORKDIR /app
 
 RUN go build -o ingest cmd/main.go
 
+ENV symbols=BNBBTC
+
 CMD ["/app/ingest"]
