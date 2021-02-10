@@ -1,6 +1,7 @@
 package binance
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
@@ -10,43 +11,46 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Binance struct {
-	conn           *websocket.Conn
-	allowedSymbols map[string]bool
-	tradesQueue    chan TradePayload
+	conn         *websocket.Conn
+	symbols      map[string]bool
+	sendQueue    chan SendMessagePayload
+	sendQueueId  uint32
+	receiveQueue chan ResponseStreamPayload
+	conds        map[uint32]ResponseCond
+	responses    map[uint32]json.RawMessage
 }
 
-func New(u url.URL, allowedSymbols map[string]bool) (*Binance, error) {
+func New(u url.URL, symbols map[string]bool) (*Binance, error) {
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "error while dialing")
 	}
 
 	return &Binance{
-		conn:           c,
-		allowedSymbols: allowedSymbols,
-		tradesQueue:    make(chan TradePayload, TradesQueueSize),
+		conn:         c,
+		symbols:      symbols,
+		sendQueue:    make(chan SendMessagePayload, SendQueueSize),
+		sendQueueId:  0,
+		receiveQueue: make(chan ResponseStreamPayload, ReceiveQueueSize),
+		conds:        make(map[uint32]ResponseCond),
+		responses:    make(map[uint32]json.RawMessage),
 	}, nil
 }
 
 func (b *Binance) Start(done chan struct{}, interrupt chan os.Signal) error {
+	go b.startReading(done)
 	for {
 		select {
 		case <-done:
 			return nil
-		case trade := <-b.tradesQueue:
-			// Only allow designated symbols and "trade" event type
-			if _, ok := b.allowedSymbols[strings.ToLower(trade.Symbol)]; !ok || trade.EventType != "trade" {
-				continue
-			}
-
-			err := b.conn.WriteJSON(WrappedStreamPayload{
-				Stream: fmt.Sprintf("%s@%s", trade.Symbol, trade.EventType),
-				Data:   trade,
-			})
+		case message := <-b.sendQueue:
+			err := b.conn.WriteJSON(message)
 			if err != nil {
 				return errors.Wrap(err, "error while writing")
 			}
@@ -68,49 +72,95 @@ func (b *Binance) Start(done chan struct{}, interrupt chan os.Signal) error {
 	}
 }
 
-// TradeGenerator is simulating starting part of pipeline that trades are ingested to
-func (b *Binance) TradeGenerator(done chan struct{}) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			b.tradesQueue <- TradePayload{
-				EventType:                "trade",
-				EventTime:                123456789,
-				Symbol:                   "BNBBTC",
-				TradeId:                  12345,
-				Price:                    "0.001",
-				Quantity:                 "100",
-				BuyerOrderId:             88,
-				SellerOrderId:            50,
-				TradeTime:                123456785,
-				IsTheBuyerTheMarketMaker: true,
-				Ignore:                   true,
-			}
-		}
-	}
+func (b *Binance) Receive() chan ResponseStreamPayload {
+	return b.receiveQueue
 }
 
-func (b *Binance) ReadFromSocket(done chan struct{}) {
+func (b *Binance) sendMessage(method string, params []string) json.RawMessage {
+	id := atomic.AddUint32(&b.sendQueueId, 1)
+	lock := &sync.Mutex{}
+	lock.Lock()
+
+	cond := sync.NewCond(lock)
+	b.conds[id] = ResponseCond{
+		Lock: lock,
+		Cond: cond,
+	}
+	b.sendQueue <- SendMessagePayload{
+		Method: method,
+		Params: params,
+		ID:     id,
+	}
+	cond.Wait()
+	lock.Unlock()
+
+	result := b.responses[id]
+	delete(b.conds, id)
+	delete(b.responses, id)
+	return result
+}
+
+// Blocking
+func (b *Binance) WatchSymbol(symbol string) error {
+	if len(b.symbols) >= 1204 {
+		return errors.New("maximum number of symbols reached")
+	}
+	symbol = strings.ToLower(strings.TrimSpace(symbol))
+	resp := b.sendMessage("SUBSCRIBE", []string{symbol + "@trade"})
+	if jsonData, err := json.Marshal(resp); err == nil && bytes.Equal(jsonData, []byte("null")) {
+		return nil
+	}
+	return errors.New(fmt.Sprintf("could not watch %q", symbol))
+}
+
+// Blocking
+func (b *Binance) UnwatchSymbol(symbol string) error {
+	symbol = strings.ToLower(strings.TrimSpace(symbol))
+	if _, ok := b.symbols[symbol]; !ok {
+		return errors.New(fmt.Sprintf("%q is not watched", symbol))
+	}
+	resp := b.sendMessage("UNSUBSCRIBE", []string{symbol + "@trade"})
+	if jsonData, err := json.Marshal(resp); err == nil && bytes.Equal(jsonData, []byte("null")) {
+		return nil
+	}
+	return errors.New(fmt.Sprintf("could not unwatch %q", symbol))
+
+}
+
+func (b *Binance) startReading(done chan struct{}) {
 	defer close(done)
 	for {
 		_, message, err := b.conn.ReadMessage()
 		if err != nil {
+			var closeErr websocket.CloseError
+			if errors.As(err, &closeErr) {
+				if closeErr.Code == 1000 {
+					continue
+				}
+			}
 			log.Println("error while reading:", err)
 			return
 		}
-		var res ResponseStreamPayload
-		if err = json.Unmarshal(message, &res); err != nil {
-			log.Printf("received message: %s", message)
+
+		var msg ReceiveMessagePayload
+		if err = json.Unmarshal(message, &msg); err == nil && msg.ID > 0 {
+			msgId := uint32(msg.ID)
+			if _, ok := b.conds[msgId]; ok {
+				b.conds[msgId].Lock.Lock()
+				b.responses[msgId] = msg.Result
+				b.conds[msgId].Cond.Broadcast()
+				b.conds[msgId].Lock.Unlock()
+			}
 			continue
 		}
 
-		message, _ = json.MarshalIndent(res.Data, "", "	")
-		log.Printf("received message from %s:\n%s\n\n", res.Stream, message)
+		var res ResponseStreamPayload
+		if err = json.Unmarshal(message, &res); err != nil {
+			log.Printf("received unhandled message: %s", message)
+			continue
+		}
+
+		b.receiveQueue <- res
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/masihyeganeh/binance-ingest/internal/binance"
@@ -17,12 +18,13 @@ func main() {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
-	allowedSymbols, err := getSymbolsFromEnv()
+	// Reading symbols from ENV
+	symbols, err := getSymbolsFromEnv()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	streams := getStreamsFromSymbols(allowedSymbols, "trade")
+	streams := getStreamsFromSymbols(symbols, "trade")
 
 	u := url.URL{
 		Scheme:   "wss",
@@ -30,9 +32,9 @@ func main() {
 		Path:     "/stream",
 		RawQuery: "streams=" + strings.Join(streams, "/"),
 	}
-	log.Printf("connecting to %s", u.String())
+	log.Printf("Connecting to %s websocket", u.String())
 
-	app, err := binance.New(u, allowedSymbols)
+	app, err := binance.New(u, symbols)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,12 +43,38 @@ func main() {
 
 	done := make(chan struct{})
 
-	go app.ReadFromSocket(done)
-	go app.TradeGenerator(done)
+	go func() {
+		err = app.Start(done, interrupt)
+		if err != nil {
+			log.Println(err.Error())
+		}
+	}()
 
-	err = app.Start(done, interrupt)
+	log.Println("Started receiving trades")
+
+	err = app.WatchSymbol("NEOBTC")
 	if err != nil {
-		log.Println(err.Error())
+		log.Print(err.Error())
+	} else {
+		log.Println("Watched NEOBTC")
+	}
+
+	err = app.UnwatchSymbol("BNBBTC")
+	if err != nil {
+		log.Print(err.Error())
+	} else {
+		log.Println("Unwatched BNBBTC")
+	}
+
+	recv := app.Receive()
+	for {
+		select {
+		case <-done:
+			return
+		case res := <-recv:
+			message, _ := json.MarshalIndent(res.Data, "", "	")
+			log.Printf("received message from %s to process:\n%s\n\n", res.Stream, message)
+		}
 	}
 
 }
@@ -64,26 +92,26 @@ func getStreamsFromSymbols(symbols map[string]bool, eventType string) []string {
 }
 
 func getSymbolsFromEnv() (map[string]bool, error) {
-	allowedSymbols := make(map[string]bool)
-	symbols := strings.Split(os.Getenv("symbols"), ",")
+	symbols := make(map[string]bool)
+	envSymbols := strings.Split(os.Getenv("symbols"), ",")
 
-	for _, symbol := range symbols {
+	for _, symbol := range envSymbols {
 		symbol = strings.TrimSpace(strings.ToLower(symbol))
 		if len(symbol) == 0 {
 			continue
 		}
-		if _, exists := allowedSymbols[symbol]; !exists {
-			allowedSymbols[symbol] = true
+		if _, exists := symbols[symbol]; !exists {
+			symbols[symbol] = true
 		}
 	}
 
-	if len(allowedSymbols) == 0 {
+	if len(symbols) == 0 {
 		return nil, errors.New("no symbol is requested")
 	}
 
-	if len(allowedSymbols) > 1024 {
-		return nil, errors.New("no more than 1024 streams are allowed. you asked for " + strconv.Itoa(len(allowedSymbols)))
+	if len(symbols) > 1024 {
+		return nil, errors.New("no more than 1024 streams are allowed. you asked for " + strconv.Itoa(len(symbols)))
 	}
 
-	return allowedSymbols, nil
+	return symbols, nil
 }

@@ -1,3 +1,4 @@
 package binance
 
-const TradesQueueSize = 10
+const SendQueueSize = 10
+const ReceiveQueueSize = 10

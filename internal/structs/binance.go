@@ -1,5 +1,7 @@
 package structs
 
+import "encoding/json"
+
 type TradePayload struct {
 	EventType                string `json:"e"`
 	EventTime                int    `json:"E"`
@@ -19,7 +21,13 @@ type ResponseStreamPayload struct {
 	Data   TradePayload `json:"data"`
 }
 
-type WrappedStreamPayload struct {
-	Stream string      `json:"stream"`
-	Data   interface{} `json:"data"`
+type SendMessagePayload struct {
+	Method string   `json:"method"`
+	Params []string `json:"params,omitempty"`
+	ID     uint32   `json:"id"`
+}
+
+type ReceiveMessagePayload struct {
+	Result json.RawMessage `json:"result"`
+	ID     int             `json:"id"`
 }
