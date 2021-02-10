@@ -3,10 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/masihyeganeh/binance-ingest/internal/binance"
 	"log"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -24,17 +22,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	streams := getStreamsFromSymbols(symbols, "trade")
-
-	u := url.URL{
-		Scheme:   "wss",
-		Host:     "stream.binance.com:9443",
-		Path:     "/stream",
-		RawQuery: "streams=" + strings.Join(streams, "/"),
-	}
-	log.Printf("Connecting to %s websocket", u.String())
-
-	app, err := binance.New(u, symbols)
+	app, err := binance.New(symbols)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -77,18 +65,6 @@ func main() {
 		}
 	}
 
-}
-
-func getStreamsFromSymbols(symbols map[string]bool, eventType string) []string {
-	result := make([]string, len(symbols))
-
-	i := 0
-	for symbol := range symbols {
-		result[i] = fmt.Sprintf("%s@%s", symbol, eventType)
-		i++
-	}
-
-	return result
 }
 
 func getSymbolsFromEnv() (map[string]bool, error) {

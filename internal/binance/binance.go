@@ -26,7 +26,17 @@ type Binance struct {
 	responses    map[uint32]json.RawMessage
 }
 
-func New(u url.URL, symbols map[string]bool) (*Binance, error) {
+func New(symbols map[string]bool) (*Binance, error) {
+	streams := getStreamsFromSymbols(symbols, "trade")
+
+	u := url.URL{
+		Scheme:   "wss",
+		Host:     "stream.binance.com:9443",
+		Path:     "/stream",
+		RawQuery: "streams=" + strings.Join(streams, "/"),
+	}
+	log.Printf("Connecting to %s websocket", u.String())
+
 	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "error while dialing")
@@ -132,12 +142,6 @@ func (b *Binance) startReading(done chan struct{}) {
 	for {
 		_, message, err := b.conn.ReadMessage()
 		if err != nil {
-			var closeErr websocket.CloseError
-			if errors.As(err, &closeErr) {
-				if closeErr.Code == 1000 {
-					continue
-				}
-			}
 			log.Println("error while reading:", err)
 			return
 		}
@@ -169,4 +173,16 @@ func (b *Binance) Close() error {
 		return b.conn.Close()
 	}
 	return nil
+}
+
+func getStreamsFromSymbols(symbols map[string]bool, eventType string) []string {
+	result := make([]string, len(symbols))
+
+	i := 0
+	for symbol := range symbols {
+		result[i] = fmt.Sprintf("%s@%s", symbol, eventType)
+		i++
+	}
+
+	return result
 }
