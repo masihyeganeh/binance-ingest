@@ -64,7 +64,6 @@ func main() {
 			log.Printf("received message from %s to process:\n%s\n\n", res.Stream, message)
 		}
 	}
-
 }
 
 func getSymbolsFromEnv() (map[string]bool, error) {
